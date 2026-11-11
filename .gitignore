@@ -10,6 +10,9 @@ venv/
 main_backup.py
 *_backup.py
 config_local.py
+wifi.json
+wifi.json.tmp
+status.txt
 
 # 系统/编辑器
 .DS_Store

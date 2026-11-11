@@ -30,6 +30,7 @@
 - **增量刷新**：只重画发生变化的数值，名称和不变的数据纹丝不动，大幅减少闪屏
 - **2 秒自动刷新**：盘中 2 秒/次，休盘 30 秒/次（兼顾防限流与省电）
 - **看门狗兜底**：内置看门狗，异常时自动重启恢复
+- **手机网页配网**：首次启动、连接失败或开机按住 D 键时，通过 `AlphaPi-Setup` 热点配置 Wi-Fi，无需在代码中保存密码
 
 ## 🔌 硬件要求
 
@@ -40,16 +41,7 @@
 
 ## 🚀 快速开始
 
-**1. 填入你的 WiFi**
-
-打开 `stock_ticker.py`，修改顶部两行：
-
-```python
-WIFI_SSID = "YOUR_WIFI_SSID"      # 改成你的 WiFi 名称
-WIFI_PASS = "YOUR_WIFI_PASSWORD"  # 改成你的 WiFi 密码
-```
-
-**2. 刷入设备**
+**1. 刷入设备**
 
 安装 [mpremote](https://docs.micropython.org/en/latest/reference/mpremote.html)（`pip install mpremote`），然后：
 
@@ -59,6 +51,19 @@ mpremote connect COM3 reset
 ```
 
 > 串口号（`COM3`）按你的实际情况修改（Windows 在设备管理器里查看，Mac/Linux 一般是 `/dev/ttyUSB*` 或 `/dev/ttyACM*`）。
+
+**2. 手机配网**
+
+首次启动时设备会创建开放热点 `AlphaPi-Setup`：
+
+1. 手机连接 `AlphaPi-Setup`
+2. 浏览器打开 `http://192.168.4.1`
+3. 输入 2.4GHz Wi-Fi 名称和密码
+4. 点击“保存并连接”，设备会自动重启
+
+以后连接失败时会自动重新进入配网；也可以在开机时持续按住 D 键约 0.8 秒强制进入。酒店、商场等需要网页认证的公共 Wi-Fi 建议通过手机热点中转。
+
+Wi-Fi 配置保存在设备的 `wifi.json`，该文件已加入 `.gitignore`。配网热点是临时开放热点，密码通过本地 HTTP 页面提交并以明文保存在设备上。
 
 **3. 完成**
 
