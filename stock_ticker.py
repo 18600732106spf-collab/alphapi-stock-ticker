@@ -6,16 +6,15 @@
 #  盘后标记；红涨绿跌；北京时间到秒；增量刷新减少闪烁。
 #  美股采用 ETF(SOXQ/QQQ) 而非指数，以支持盘前/盘后实时行情。
 #
-#  使用方法：
-#    1. 修改下方 WIFI_SSID / WIFI_PASS 为你自己的 WiFi
-#    2. mpremote connect COM3 fs cp stock_ticker.py :main.py
-#       mpremote connect COM3 reset
-#    3. 按键 A/B/C/D 切换页面
+#  WiFi 配网：首次启动、连接失败，或开机持续按住 D 键时，设备会创建
+#  AlphaPi-Setup 热点。手机连接后访问 http://192.168.4.1 完成配网。
+#  正常运行时按键 A/B/C/D 切换页面。
 #
 #  运行环境：AlphaPi One S v1.7（ESP32-S2，MicroPython 1.19.1）
 #  数据源：新浪主力（单请求 8 指数）+ 腾讯/东财备用，自动降级
 # ============================================================
 import time
+import os
 import network, socket, machine
 try:
     import ujson as json
@@ -27,10 +26,11 @@ from printChange231213 import clear, printXy, tft
 import zlib
 import gc
 
-# ===== 必改：填入你的 WiFi 信息 =====
-WIFI_SSID = "YOUR_WIFI_SSID"
-WIFI_PASS = "YOUR_WIFI_PASSWORD"
-# ===================================
+# ===== 手机配网 =====
+WIFI_CONFIG_FILE = "wifi.json"
+SETUP_AP_SSID = "AlphaPi-Setup"
+SETUP_AP_IP = "192.168.4.1"
+WIFI_CONNECT_TRIES = 30   # 每次 0.5 秒，合计约 15 秒
 
 REFRESH_SEC = 2         # 盘中数据刷新间隔（秒）
 IDLE_REFRESH_SEC = 30   # 休盘时的探测间隔（秒，只查状态不抓全量）
@@ -193,12 +193,183 @@ def ensure_dns(w):
     return "0.0.0.0"
 
 
-def connect_wifi():
+def load_wifi_config():
+    """读取独立 WiFi 配置；文件不存在或损坏时返回空配置。"""
+    try:
+        with open(WIFI_CONFIG_FILE, "r") as f:
+            cfg = json.loads(f.read())
+        return cfg.get("ssid", ""), cfg.get("password", "")
+    except Exception:
+        return "", ""
+
+
+def save_wifi_config(ssid, password):
+    """先写临时文件再替换，避免断电留下半个配置文件。"""
+    tmp = WIFI_CONFIG_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(json.dumps({"ssid": ssid, "password": password}))
+    try:
+        os.remove(WIFI_CONFIG_FILE)
+    except Exception:
+        pass
+    os.rename(tmp, WIFI_CONFIG_FILE)
+
+
+def d_held_at_boot():
+    """开机持续按住 D 键约 0.8 秒，强制进入手机配网。"""
+    try:
+        pin = hal.key_map.get(4)
+        if pin is None or pin.value() != 1:
+            return False
+        for _ in range(16):
+            time.sleep_ms(50)
+            if pin.value() != 1:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _url_decode(value):
+    """解码 application/x-www-form-urlencoded 字段，支持中文 SSID。"""
+    out = bytearray()
+    i = 0
+    while i < len(value):
+        ch = value[i]
+        if ch == "+":
+            out.append(32)
+            i += 1
+        elif ch == "%" and i + 2 < len(value):
+            try:
+                out.append(int(value[i + 1:i + 3], 16))
+                i += 3
+            except Exception:
+                out.append(ord(ch))
+                i += 1
+        else:
+            out.append(ord(ch))
+            i += 1
+    return bytes(out).decode("utf-8")
+
+
+def _send_http(conn, status, body, content_type="text/html; charset=utf-8"):
+    data = body.encode("utf-8")
+    head = ("HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %d\r\n"
+            "Connection: close\r\nCache-Control: no-store\r\n\r\n" %
+            (status, content_type, len(data))).encode()
+    conn.send(head + data)
+
+
+def _setup_page(message=""):
+    note = ("<p class='msg'>%s</p>" % message) if message else ""
+    return """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AlphaPi Wi-Fi</title><style>
+body{font-family:sans-serif;background:#f3f4f6;margin:0;padding:24px;color:#111}
+.box{max-width:420px;margin:auto;background:white;padding:24px;border-radius:16px;box-shadow:0 4px 20px #bbb}
+h2{margin-top:0}label{display:block;margin-top:16px}input{box-sizing:border-box;width:100%%;padding:12px;margin-top:6px;font-size:16px}
+button{width:100%%;margin-top:22px;padding:13px;border:0;border-radius:9px;background:#111;color:white;font-size:17px}
+.msg{color:#b00020}.tip{color:#666;font-size:14px;line-height:1.5}</style></head>
+<body><div class="box"><h2>AlphaPi 手机配网</h2>%s
+<form method="post" action="/save"><label>Wi-Fi 名称</label><input name="ssid" required maxlength="64">
+<label>Wi-Fi 密码</label><input name="password" type="password" maxlength="64">
+<button type="submit">保存并连接</button></form>
+<p class="tip">仅支持 2.4GHz Wi-Fi。保存后设备会自动重启；需要网页认证的公共 Wi-Fi 请改用手机热点。</p>
+</div></body></html>""" % note
+
+
+def start_setup_portal(reason=""):
+    """启动开放热点和本地配网页；成功保存后自动重启。"""
+    sta = network.WLAN(network.STA_IF)
+    try:
+        sta.disconnect()
+    except Exception:
+        pass
+    ap = network.WLAN(network.AP_IF)
+    ap.active(True)
+    try:
+        ap.config(essid=SETUP_AP_SSID, authmode=0)
+    except Exception:
+        ap.config(essid=SETUP_AP_SSID)
+    try:
+        ap.ifconfig((SETUP_AP_IP, "255.255.255.0", SETUP_AP_IP, SETUP_AP_IP))
+    except Exception:
+        pass
+
+    clear()
+    printXy("WiFi SETUP", 8, 12, S_SIZE, C_NAME)
+    printXy(SETUP_AP_SSID, 8, 44, S_SIZE, C_FLAT)
+    printXy(SETUP_AP_IP, 8, 76, S_SIZE, C_FLAT)
+    print("SETUP AP=%s IP=%s reason=%s" % (SETUP_AP_SSID, SETUP_AP_IP, reason))
+
+    server = socket.socket()
+    server.bind(("0.0.0.0", 80))
+    server.listen(2)
+    while True:
+        conn = None
+        try:
+            conn, _ = server.accept()
+            conn.settimeout(5)
+            req = b""
+            while b"\r\n\r\n" not in req and len(req) < 4096:
+                chunk = conn.recv(512)
+                if not chunk:
+                    break
+                req += chunk
+            head, _, body = req.partition(b"\r\n\r\n")
+            lines = head.split(b"\r\n")
+            first = lines[0].decode("utf-8") if lines else "GET / HTTP/1.1"
+            parts = first.split()
+            method = parts[0] if parts else "GET"
+            path = parts[1] if len(parts) > 1 else "/"
+            content_len = 0
+            for line in lines[1:]:
+                if line.lower().startswith(b"content-length:"):
+                    content_len = int(line.split(b":", 1)[1].strip())
+                    break
+            while len(body) < content_len and len(body) < 4096:
+                chunk = conn.recv(min(512, content_len - len(body)))
+                if not chunk:
+                    break
+                body += chunk
+
+            if method == "POST" and path.startswith("/save"):
+                form = {}
+                for item in body.decode("utf-8").split("&"):
+                    key, sep, value = item.partition("=")
+                    if sep:
+                        form[key] = _url_decode(value)
+                ssid = form.get("ssid", "").strip()
+                password = form.get("password", "")
+                if not ssid:
+                    _send_http(conn, "400 Bad Request", _setup_page("请输入 Wi-Fi 名称"))
+                else:
+                    save_wifi_config(ssid, password)
+                    _send_http(conn, "200 OK", "<meta charset='utf-8'><h2>保存成功</h2><p>设备正在重启并连接新网络。</p>")
+                    conn.close()
+                    conn = None
+                    time.sleep(2)
+                    machine.reset()
+            else:
+                _send_http(conn, "200 OK", _setup_page())
+        except Exception as e:
+            print("SETUP HTTP error: %r" % (e,))
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+
+def connect_wifi(ssid, password):
     w = network.WLAN(network.STA_IF)
     w.active(True)
+    if not ssid:
+        return False
     if not w.isconnected():
-        w.connect(WIFI_SSID, WIFI_PASS)
-        for _ in range(30):
+        w.connect(ssid, password)
+        for _ in range(WIFI_CONNECT_TRIES):
             if w.isconnected():
                 break
             time.sleep(0.5)
@@ -794,12 +965,15 @@ def read_button():
 def main():
     clear()
     draw_logo_centered()  # 开机页居中显示"涨停"logo
-    wifi_ok = connect_wifi()
-    if wifi_ok:
-        sync_time()
+    if d_held_at_boot():
+        start_setup_portal("D button")
+    wifi_ssid, wifi_password = load_wifi_config()
+    if not wifi_ssid:
+        start_setup_portal("no config")
+    wifi_ok = connect_wifi(wifi_ssid, wifi_password)
     if not wifi_ok:
-        clear()
-        printXy("WiFi FAIL", 4, 60, S_SIZE, C_UP)
+        start_setup_portal("connect failed")
+    sync_time()
     print("BOOT wifi_ok=%s" % wifi_ok)
     page = 0
     last_btn = 0
